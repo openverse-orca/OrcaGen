@@ -1,0 +1,7 @@
+orca-gym
+gymnasium
+numpy
+scipy
+matplotlib
+websockets
+
