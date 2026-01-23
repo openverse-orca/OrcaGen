@@ -175,9 +175,20 @@ class CaptureRunner(BaseRunner):
                     if self.config.contacts_mode == "assume_ground":
                         has_contact = True
                         contact_pairs = [[oid, "ground"] for oid in obj_ids]
-                        for oid in obj_ids:
-                            if collision_times[oid] is None:
-                                collision_times[oid] = 0
+                        # 额外补充物体-物体碰撞（不改变 ground 标注）
+                        try:
+                            contacts_simple = base_env.query_contact_simple()
+                        except Exception:
+                            contacts_simple = []
+                        obj_pairs = self._get_contact_pairs(base_env, contacts_simple, obj_id_by_body)
+                        obj_set = set(obj_ids)
+                        for p in obj_pairs:
+                            if len(p) == 2 and p[0] in obj_set and p[1] in obj_set:
+                                if p not in contact_pairs:
+                                    contact_pairs.append(p)
+                                for oid in p:
+                                    if collision_times[oid] is None or collision_times[oid] == 0:
+                                        collision_times[oid] = recorded
                     elif self.config.contacts_mode == "remote":
                         try:
                             contacts_simple = base_env.query_contact_simple()
