@@ -10,6 +10,11 @@
 
 ## 快速开始
 
+### 系统依赖
+- OrcaStudio/OrcaSim（负责渲染与仿真）
+- OrcaGym Server（gRPC 服务，默认端口 `50051`）
+- ffmpeg（可选：用于 ws 录像转码/视频后处理）
+
 ### 1) 安装依赖
 ```bash
 pip install -r requirements.txt
@@ -29,6 +34,10 @@ python examples/run_capture.py \
 - `--external_drive`：由外部程序驱动仿真，本程序仅采集/录像
 - `--save_video`：服务端录制视频（gRPC）
 - 默认 `no_render=True`，如需 render 可在配置里调整
+
+注意：
+- 为确保视频时长正确，需要在 OrcaStudio 中将 MuJoCoCamera 锁定为 30 帧：
+  Home 键唤起菜单 → Video Options → 选择 30
 
 ## 输出
 ```
