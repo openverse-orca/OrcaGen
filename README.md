@@ -17,7 +17,7 @@ pip install -r requirements.txt
 
 ### 2) 启动采集
 ```bash
-python /home/guojiatao/OrcaWorkStation/OrcaGen/OrcaGen/examples/run_capture.py \
+python examples/run_capture.py \
   --orcagym_addr localhost:50051 \
   --object_site 待录制物体 \
   --duration_s 30 --fps 30 \
