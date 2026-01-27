@@ -7,6 +7,7 @@ import subprocess
 import sys
 import time
 import shutil
+import glob
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -47,7 +48,6 @@ class CaptureRunner(BaseRunner):
         if self.config.external_drive:
             self.config.no_drive_sim = True
             self.config.no_reset = True
-            self.config.no_render = True
 
         env_adapter = OrcaGymEnvAdapter(self.config)
         env_adapter.initialize()
@@ -124,6 +124,9 @@ class CaptureRunner(BaseRunner):
         ws_started = False
         render_err_count = 0
         camera_frame_seen = False
+        camera_frame_count = 0
+        camera_first_idx: Optional[int] = None
+        camera_last_idx: Optional[int] = None
 
         try:
             with open(meta_path, "w", encoding="utf-8") as f:
@@ -165,6 +168,10 @@ class CaptureRunner(BaseRunner):
                         if cur_frame == last_frame_idx:
                             time.sleep(0.001)
                             continue
+                        if camera_first_idx is None:
+                            camera_first_idx = cur_frame
+                        camera_last_idx = cur_frame
+                        camera_frame_count += 1
                         last_frame_idx = cur_frame
 
                     cam_pos_ws = cam_pose_worldsim_pos if cam_body is None else env_adapter.get_body_pose(cam_body).pos
@@ -282,6 +289,13 @@ class CaptureRunner(BaseRunner):
                     print(f"[OrcaGen] 警告：stop_save_video 失败（可能导致视频未 finalize）：{e}")
 
         motion_map = infer_motion_types(meta_path, obj_ids) if self.config.infer_motion else {oid: MotionType.UNKNOWN for oid in obj_ids}
+        video_artifacts, camera_ids = self._collect_video_artifacts(
+            video_save_dir=video_save_dir,
+            seq_dir=seq_dir,
+            camera_name_filter=self.config.camera_name,
+        ) if self.config.save_video else ([], [])
+        if not video_artifacts:
+            video_artifacts = [{"path": "video/rgb_main.mp4", "camera_id": "main"}]
         index_path = os.path.join(meta_dir, "index.json")
         size_source = "site_size" if self.config.object_source == "site" else "geom_size"
         index = {
@@ -310,7 +324,7 @@ class CaptureRunner(BaseRunner):
                 "frame_skip": int(self.config.frame_skip),
             },
             "artifacts": {
-                "video": [{"path": "video/rgb_main.mp4", "camera_id": "main"}],
+                "video": video_artifacts,
                 "project": {"path": "project/scene.usd", "format": "USD", "contains": "keyframes+dyn_cache"},
             },
             "objects": [
@@ -325,14 +339,10 @@ class CaptureRunner(BaseRunner):
                 }
                 for oid in obj_ids
             ],
-            "cameras": [
-                {
-                    "camera_id": "main",
-                    "body_name": cam_body,
-                    "camera_name": self.config.camera_name if cam_body is None else None,
-                    "extrinsics_world0": {"pos": [0.0, 0.0, 0.0], "quat": [1.0, 0.0, 0.0, 0.0]},
-                }
-            ],
+            "cameras": self._build_camera_entries(
+                cam_body=cam_body,
+                camera_ids=camera_ids,
+            ),
         }
         with open(index_path, "w", encoding="utf-8") as f:
             json.dump(index, f, ensure_ascii=False, indent=2)
@@ -369,9 +379,18 @@ class CaptureRunner(BaseRunner):
 
         if self.config.save_video and (not camera_frame_seen):
             print("[OrcaGen] 警告：采集期间相机帧索引一直不可用（get_current_frame/get_next_frame < 0），mp4 可能为空。请确认 OrcaEditor 中相机/Viewport 已启用并在渲染。")
+        if camera_frame_count > 0:
+            est_fps = camera_frame_count / max(1e-6, float(self.config.duration_s))
+            print(f"[OrcaGen] camera_frames={camera_frame_count}, camera_fps≈{est_fps:.2f}, first_idx={camera_first_idx}, last_idx={camera_last_idx}")
+            if camera_frame_count < int(self.config.duration_s * self.config.fps * 0.5):
+                print("[OrcaGen] 警告：相机帧数量明显偏少，视频可能提前结束或后半段静止。")
 
-        if self.config.save_video and self.config.normalize_video:
-            self._normalize_videos(video_save_dir)
+        # if self.config.save_video:
+        #     self._wait_for_video_stable(video_save_dir)
+        #     if self.config.repack_video:
+        #         self._repack_videos(video_save_dir)
+        # if self.config.save_video and self.config.normalize_video:
+        #     self._normalize_videos(video_save_dir)
 
         if self.config.plot_motion:
             self._plot_motion(meta_path, meta_dir)
@@ -491,6 +510,9 @@ class CaptureRunner(BaseRunner):
         if cam_body is not None:
             cam0 = env_adapter.get_body_pose(cam_body)
             return cam0.pos, cam0.mat
+        if not self.config.camprobe:
+            print("[OrcaGen] 警告：未找到相机 body，且未开启 --camprobe；将使用单位矩阵作为相机位姿。")
+            return np.zeros(3, dtype=np.float64), np.eye(3, dtype=np.float64)
         probe_dir = os.path.join(self.config.output_root, ".orcagen_camprobe", seq_id)
         mkdirp(probe_dir)
         cam0 = env_adapter.get_camera_pose(None, self.config.camera_name, probe_dir)
@@ -554,41 +576,212 @@ class CaptureRunner(BaseRunner):
             pass
         return None
 
-    def _normalize_videos(self, video_save_dir: str) -> None:
-        try:
-            target = float(self.config.duration_s)
+    # def _normalize_videos(self, video_save_dir: str) -> None:
+    #     try:
+    #         target = float(self.config.duration_s)
+    #         for root, _, files in os.walk(video_save_dir):
+    #             for fn in files:
+    #                 if not fn.lower().endswith(".mp4"):
+    #                     continue
+    #                 src = os.path.join(root, fn)
+    #                 dur = self._get_video_duration_s(src)
+    #                 if dur is None or target <= 0:
+    #                     continue
+    #                 ratio = dur / target
+    #                 if 0.95 <= ratio <= 1.05:
+    #                     continue
+    #                 out = src.replace(".mp4", "_normalized.mp4")
+    #                 speed = ratio
+    #                 subprocess.run(
+    #                     [
+    #                         "ffmpeg",
+    #                         "-y",
+    #                         "-hide_banner",
+    #                         "-i",
+    #                         src,
+    #                         "-filter:v",
+    #                         f"setpts=PTS/{speed:.6f}",
+    #                         "-r",
+    #                         str(int(self.config.fps)),
+    #                         "-an",
+    #                         out,
+    #                     ],
+    #                     check=True,
+    #                 )
+    #                 print(f"[OrcaGen] 已校正视频速度: {src} -> {out} (ratio={ratio:.3f})")
+    #     except Exception as e:
+    #         print(f"[OrcaGen] 警告：视频速度校正失败：{e}")
+
+    def _wait_for_video_stable(self, video_save_dir: str, timeout_s: float = 3.0) -> None:
+        start = time.time()
+        while time.time() - start < timeout_s:
+            changed = False
             for root, _, files in os.walk(video_save_dir):
                 for fn in files:
                     if not fn.lower().endswith(".mp4"):
                         continue
-                    src = os.path.join(root, fn)
-                    dur = self._get_video_duration_s(src)
-                    if dur is None or target <= 0:
-                        continue
-                    ratio = dur / target
-                    if 0.95 <= ratio <= 1.05:
-                        continue
-                    out = src.replace(".mp4", "_normalized.mp4")
-                    speed = ratio
-                    subprocess.run(
-                        [
-                            "ffmpeg",
-                            "-y",
-                            "-hide_banner",
-                            "-i",
-                            src,
-                            "-filter:v",
-                            f"setpts=PTS/{speed:.6f}",
-                            "-r",
-                            str(int(self.config.fps)),
-                            "-an",
-                            out,
-                        ],
-                        check=True,
-                    )
-                    print(f"[OrcaGen] 已校正视频速度: {src} -> {out} (ratio={ratio:.3f})")
-        except Exception as e:
-            print(f"[OrcaGen] 警告：视频速度校正失败：{e}")
+                    fp = os.path.join(root, fn)
+                    try:
+                        s1 = os.path.getsize(fp)
+                        time.sleep(0.2)
+                        s2 = os.path.getsize(fp)
+                        if s2 != s1:
+                            changed = True
+                    except Exception:
+                        pass
+            if not changed:
+                return
+    
+    def _parse_camera_file(self, file_path: str) -> tuple[str, Optional[str]]:
+        base = os.path.splitext(os.path.basename(file_path))[0]
+        stream = None
+        camera_name = base
+        if base.endswith("_color"):
+            camera_name = base[:-6]
+            stream = "color"
+        elif base.endswith("_depth"):
+            camera_name = base[:-6]
+            stream = "depth"
+        elif base.endswith("_seg"):
+            camera_name = base[:-4]
+            stream = "seg"
+        if stream is None:
+            parent = os.path.basename(os.path.dirname(file_path)).lower()
+            if parent in ("depth", "seg", "segmentation"):
+                stream = parent
+        return camera_name, stream
+
+    def _collect_video_artifacts(
+        self,
+        video_save_dir: str,
+        seq_dir: str,
+        camera_name_filter: Optional[str] = None,
+    ) -> tuple[list[dict], list[str]]:
+        if not os.path.exists(video_save_dir):
+            return [], []
+        video_files = []
+        for root, _, files in os.walk(video_save_dir):
+            for fn in files:
+                if fn.lower().endswith((".mp4", ".h264", ".mov", ".avi")):
+                    video_files.append(os.path.join(root, fn))
+        if not video_files:
+            return [], []
+        artifacts: list[dict] = []
+        camera_ids: set[str] = set()
+        for fp in sorted(set(video_files)):
+            rel_path = os.path.relpath(fp, seq_dir).replace(os.sep, "/")
+            camera_name, stream = self._parse_camera_file(fp)
+            if camera_name_filter and camera_name != camera_name_filter:
+                continue
+            camera_id = "main" if camera_name == self.config.camera_name else camera_name
+            entry = {"path": rel_path, "camera_id": camera_id}
+            if stream:
+                entry["stream"] = stream
+            artifacts.append(entry)
+            camera_ids.add(camera_id)
+        return artifacts, sorted(camera_ids)
+    
+    def _build_camera_entries(self, cam_body: Optional[str], camera_ids: list[str]) -> list[dict]:
+        entries = [
+            {
+                "camera_id": "main",
+                "body_name": cam_body,
+                "camera_name": self.config.camera_name if cam_body is None else None,
+                "extrinsics_world0": {"pos": [0.0, 0.0, 0.0], "quat": [1.0, 0.0, 0.0, 0.0]},
+            }
+        ]
+        for cid in camera_ids:
+            if cid == "main":
+                continue
+            entries.append(
+                {
+                    "camera_id": cid,
+                    "body_name": None,
+                    "camera_name": cid,
+                    "extrinsics_world0": {"pos": [0.0, 0.0, 0.0], "quat": [1.0, 0.0, 0.0, 0.0]},
+                }
+            )
+        return entries
+
+    def _distribute_videos_by_camera(self, unified_video_dir: str, group_setups: List[Dict]) -> None:
+        video_files = []
+        for root, _, files in os.walk(unified_video_dir):
+            for fn in files:
+                if fn.lower().endswith((".mp4", ".h264", ".mov", ".avi")):
+                    video_files.append(os.path.join(root, fn))
+        if not video_files:
+            print("[OrcaGen] 警告：未找到视频文件，无法分发到各组目录")
+            return
+
+        camera_names = sorted({self._parse_camera_file(fp)[0] for fp in video_files})
+        if camera_names and len(camera_names) == len(group_setups):
+            for idx, name in enumerate(camera_names):
+                group_setups[idx]["camera_name_override"] = name
+            print(f"[OrcaGen] 多组录制：根据文件名推断 camera 映射 = {camera_names}")
+
+        for idx, setup in enumerate(group_setups):
+            target_dir = setup.get("target_video_dir", setup["video_save_dir"])
+            if os.path.abspath(target_dir) == os.path.abspath(unified_video_dir):
+                print(f"[OrcaGen] 组 {idx} camera={setup.get('camera_name_override', setup['config'].camera_name)} 目标目录与统一目录一致，跳过复制")
+                continue
+            camera_name = setup.get("camera_name_override", setup["config"].camera_name)
+            matched = 0
+            mkdirp(target_dir)
+            for src_file in video_files:
+                src_camera, _ = self._parse_camera_file(src_file)
+                if src_camera != camera_name:
+                    continue
+                rel_path = os.path.relpath(src_file, unified_video_dir)
+                target_file = os.path.join(target_dir, rel_path)
+                target_parent = os.path.dirname(target_file)
+                mkdirp(target_parent)
+                try:
+                    if os.path.exists(target_file):
+                        os.remove(target_file)
+                    shutil.move(src_file, target_file)
+                    matched += 1
+                except Exception as e:
+                    print(f"[OrcaGen] 警告：移动视频到组 {idx} 失败：{e}")
+            print(f"[OrcaGen] 组 {idx} camera={camera_name} 移动文件数={matched}")
+    # def _repack_videos(self, video_save_dir: str) -> None:
+    #     if shutil.which("ffmpeg") is None:
+    #         print("[OrcaGen] 警告：未找到 ffmpeg，跳过视频重封装。")
+    #         return
+    #     for root, _, files in os.walk(video_save_dir):
+    #         for fn in files:
+    #             if not fn.lower().endswith(".mp4"):
+    #                 continue
+    #             src = os.path.join(root, fn)
+    #             tmp = src.replace(".mp4", "_repack_tmp.mp4")
+    #             try:
+    #                 subprocess.run(
+    #                     [
+    #                         "ffmpeg",
+    #                         "-y",
+    #                         "-err_detect",
+    #                         "ignore_err",
+    #                         "-fflags",
+    #                         "+discardcorrupt",
+    #                         "-i",
+    #                         src,
+    #                         "-c:v",
+    #                         "libx264",
+    #                         "-pix_fmt",
+    #                         "yuv420p",
+    #                         tmp,
+    #                     ],
+    #                     check=True,
+    #                 )
+    #                 os.replace(tmp, src)
+    #                 print(f"[OrcaGen] 已重封装视频: {src}")
+    #             except Exception as e:
+    #                 try:
+    #                     if os.path.exists(tmp):
+    #                         os.remove(tmp)
+    #                 except Exception:
+    #                     pass
+    #                 print(f"[OrcaGen] 警告：视频重封装失败：{src} ({e})")
+
 
     def _plot_motion(self, meta_path: str, meta_dir: str) -> None:
         try:
@@ -597,4 +790,369 @@ class CaptureRunner(BaseRunner):
             plot_motion_curves(meta_path, plots_dir)
         except Exception as e:
             print(f"[OrcaGen] 警告：生成运动曲线图失败：{e}")
+
+class MultiEnvCaptureRunner(BaseRunner):
+    """
+    多子环境录制：为每个组创建独立 env 实例并分别录制
+    用于确保每个子环境的 camera 录制到对应目录
+    """
+    def __init__(self, group_configs: List[CaptureConfig]) -> None:
+        self.group_configs = group_configs
+        if not group_configs:
+            raise ValueError("group_configs 不能为空")
+
+    def run(self) -> None:
+        for idx, config in enumerate(self.group_configs):
+            print(f"[OrcaGen] 启动子环境 {idx} 录制: seq_id={config.sequence_id}")
+            runner = CaptureRunner(config)
+            runner.run()
+
+
+class MultiGroupCaptureRunner(BaseRunner):
+    """
+    多组并行录制：使用同一个 env 实例，所有组同时开始/结束录制
+    参考 OrcaManipulation 的实现方式
+    """
+    def __init__(self, group_configs: List[CaptureConfig]) -> None:
+        self.group_configs = group_configs
+        if not group_configs:
+            raise ValueError("group_configs 不能为空")
+        # 使用第一个组的配置作为主配置（env 相关）
+        self.config = group_configs[0]
+
+    def run(self) -> None:
+        # 检查连接（使用第一个 runner 实例）
+        first_runner = CaptureRunner(self.config)
+        first_runner._check_connectivity()
+        
+        # 准备所有组的目录和配置
+        group_setups = []
+        for idx, config in enumerate(self.group_configs):
+            seq_id = config.sequence_id or first_runner._get_sequence_id()
+            seq_dir, video_dir, project_dir, meta_dir = first_runner._prepare_dirs(seq_id)
+            video_save_dir = os.path.join(video_dir, config.video_subdir)
+            mkdirp(video_save_dir)
+            group_setups.append({
+                "config": config,
+                "seq_id": seq_id,
+                "seq_dir": seq_dir,
+                "video_dir": video_dir,
+                "video_save_dir": video_save_dir,
+                "target_video_dir": video_save_dir,
+                "meta_dir": meta_dir,
+                "meta_path": os.path.join(meta_dir, "metadata.jsonl"),
+            })
+
+        # 多组共用一个录制目录（与 OrcaManipulation 一致：只录制一次，输出到一个目录）
+        unified_video_dir = group_setups[0]["video_save_dir"]
+
+        if self.config.external_drive:
+            self.config.no_drive_sim = True
+            self.config.no_reset = True
+
+        # 使用第一个组的配置初始化 env（所有组共享同一个 env）
+        env_adapter = OrcaGymEnvAdapter(self.config)
+        env_adapter.initialize()
+        env = env_adapter.env
+        base_env = env_adapter.base_env
+
+        if self.config.auto_frame_skip:
+            target = 1.0 / float(self.config.fps)
+            self.config.frame_skip = max(1, int(round(target / float(self.config.time_step_s))))
+            print(f"[OrcaGen] auto_frame_skip: time_step_s={self.config.time_step_s}, frame_skip={self.config.frame_skip}, realtime_step≈{self.config.time_step_s*self.config.frame_skip:.6f}s")
+
+        realtime_step = float(self.config.time_step_s) * int(self.config.frame_skip)
+        try:
+            base_env.metadata["render_fps"] = int(self.config.render_fps)
+        except Exception:
+            pass
+
+        # 为每个组解析对象和相机（使用第一个组的 runner 实例来调用辅助方法）
+        for setup in group_setups:
+            config = setup["config"]
+            # 临时设置 config 以便调用辅助方法
+            original_config = first_runner.config
+            first_runner.config = config
+            try:
+                obj_ids, obj_body_by_id, obj_site_by_id, obj_id_by_body = first_runner._resolve_objects(base_env)
+                cam_body = first_runner._find_camera_body(base_env)
+                cam_pose_worldsim_pos, cam_pose_worldsim_mat = first_runner._get_camera_pose(env_adapter, cam_body, setup["seq_id"])
+                obj_sizes = first_runner._infer_object_sizes(base_env, obj_ids, obj_body_by_id, obj_site_by_id)
+            finally:
+                first_runner.config = original_config
+            
+            setup["obj_ids"] = obj_ids
+            setup["obj_body_by_id"] = obj_body_by_id
+            setup["obj_site_by_id"] = obj_site_by_id
+            setup["obj_id_by_body"] = obj_id_by_body
+            setup["cam_body"] = cam_body
+            setup["cam_pose_worldsim_pos"] = cam_pose_worldsim_pos
+            setup["cam_pose_worldsim_mat"] = cam_pose_worldsim_mat
+            setup["obj_sizes"] = obj_sizes
+            setup["collision_times"] = {oid: None for oid in obj_ids}
+            # 使用第一帧的相机坐标系作为世界坐标系
+            setup["R0"] = cam_pose_worldsim_mat
+            setup["t0"] = cam_pose_worldsim_pos
+
+        # 启动视频录制（照搬 OrcaManipulation 的逻辑：只调用一次 begin_save_video）
+        # 多组共用一个录制目录，不做分发
+        cap_mode = CaptureMode.SYNC if self.config.capture_mode == "SYNC" else CaptureMode.ASYNC
+        video_started = False
+        if self.config.save_video:
+            if self.config.capture_mode == "SYNC":
+                print("[OrcaGen] 提示：你当前使用 --capture_mode SYNC；若 Editor 端出现 CameraSyncManager WaitingLastFrame Timeout，建议改为 ASYNC。")
+            # 照搬 OrcaManipulation：只调用一次 begin_save_video
+            # 使用第一个组的目录作为统一录制目录（引擎不支持同时录制到多个目录）
+            print(f"[OrcaGen] 多组录制：统一录制目录 = {unified_video_dir}")
+            env_adapter.begin_save_video(unified_video_dir, cap_mode)
+            video_started = True
+
+        total_frames = int(round(self.config.duration_s * self.config.fps))
+        do_render = not self.config.no_render
+        render_err_count = 0
+
+        # 打开所有组的元数据文件
+        meta_files = []
+        try:
+            for setup in group_setups:
+                f = open(setup["meta_path"], "w", encoding="utf-8")
+                meta_files.append((setup, f))
+            
+            recorded = 0
+            last_frame_idx = -1
+            while recorded < total_frames:
+                loop_start = time.time()
+
+                if not self.config.no_drive_sim:
+                    _ = env.step(env.action_space.sample() if env.action_space.shape != (0,) else np.array([]))
+
+                if do_render:
+                    try:
+                        env.render()
+                    except Exception:
+                        render_err_count += 1
+                        if render_err_count <= 5 or (render_err_count % 60 == 0):
+                            print(f"[OrcaGen] 警告：env.render 失败（count={render_err_count}），将继续采集。")
+                        if self.config.external_drive and render_err_count == 5:
+                            do_render = False
+                            print("[OrcaGen] external_drive 下连续 render 失败，后续将跳过 render，仅采集/录像。")
+
+                try:
+                    cur_frame = base_env.get_next_frame()
+                except Exception:
+                    cur_frame = -1
+                if cur_frame >= 0 and cur_frame == last_frame_idx:
+                    time.sleep(0.001)
+                    continue
+                last_frame_idx = cur_frame
+
+                # 为每个组采集元数据
+                for setup, f in meta_files:
+                    config = setup["config"]
+                    obj_ids = setup["obj_ids"]
+                    obj_body_by_id = setup["obj_body_by_id"]
+                    obj_site_by_id = setup["obj_site_by_id"]
+                    cam_body = setup["cam_body"]
+                    R0 = setup["R0"]
+                    t0 = setup["t0"]
+                    obj_sizes = setup["obj_sizes"]
+                    collision_times = setup["collision_times"]
+
+                    cam_pos_ws = env_adapter.get_body_pose(cam_body).pos if cam_body is not None else t0
+                    cam_mat_ws = env_adapter.get_body_pose(cam_body).mat if cam_body is not None else R0
+                    cam_pos_w0 = worldsim_to_world0(cam_pos_ws, R0, t0)
+                    cam_mat_w0 = R0.T @ cam_mat_ws
+
+                    if config.contacts_mode == "assume_ground":
+                        has_contact = True
+                        contact_pairs = [[oid, "ground"] for oid in obj_ids]
+                        try:
+                            contacts_simple = base_env.query_contact_simple()
+                        except Exception:
+                            contacts_simple = []
+                        obj_pairs = first_runner._get_contact_pairs(base_env, contacts_simple, setup["obj_id_by_body"])
+                        obj_set = set(obj_ids)
+                        for p in obj_pairs:
+                            if len(p) == 2 and p[0] in obj_set and p[1] in obj_set:
+                                if p not in contact_pairs:
+                                    contact_pairs.append(p)
+                                for oid in p:
+                                    if collision_times[oid] is None or collision_times[oid] == 0:
+                                        collision_times[oid] = recorded
+                    elif config.contacts_mode == "remote":
+                        try:
+                            contacts_simple = base_env.query_contact_simple()
+                        except Exception:
+                            contacts_simple = []
+                        contact_pairs = first_runner._get_contact_pairs(base_env, contacts_simple, setup["obj_id_by_body"])
+                        has_contact = len(contact_pairs) > 0
+                        for p in contact_pairs:
+                            for oid in obj_ids:
+                                if oid in p and collision_times[oid] is None:
+                                    collision_times[oid] = recorded
+                    else:
+                        has_contact = False
+                        contact_pairs = None
+
+                    annotations = []
+                    for oid in obj_ids:
+                        if config.object_source == "site":
+                            site_name = obj_site_by_id[oid]
+                            obj = env_adapter.get_site_pose(site_name)
+                            body_name = obj_body_by_id.get(oid)
+                        else:
+                            body_name = obj_body_by_id[oid]
+                            obj = env_adapter.get_body_pose(body_name)
+                        p_cam = cam_mat_ws.T @ (obj.pos - cam_pos_ws)
+                        R_cam_obj = cam_mat_ws.T @ obj.mat
+                        pitch_deg, yaw_deg, roll_deg = mat_to_euler_xyz_deg(R_cam_obj)
+                        pitch = norm_angle_deg_to_unit(pitch_deg)
+                        yaw = norm_angle_deg_to_unit(yaw_deg)
+                        roll = norm_angle_deg_to_unit(roll_deg)
+                        x_size, y_size, z_size = obj_sizes[oid]
+                        annotations.append({
+                            "object_id": oid,
+                            "body_name": body_name,
+                            "site_name": obj_site_by_id.get(oid),
+                            "bbox3d": {
+                                "x_center": float(p_cam[0]),
+                                "y_center": float(p_cam[1]),
+                                "z_center": float(p_cam[2]),
+                                "x_size": float(x_size),
+                                "y_size": float(y_size),
+                                "z_size": float(z_size),
+                                "pitch": pitch,
+                                "yaw": yaw,
+                                "roll": roll,
+                            },
+                            "bbox3d_array": [
+                                float(p_cam[0]), float(p_cam[1]), float(p_cam[2]),
+                                float(x_size), float(y_size), float(z_size),
+                                pitch, yaw, roll,
+                            ],
+                        })
+
+                    rec = {
+                        "frame_index": recorded,
+                        "timestamp_s": round(recorded / float(config.fps), 10),
+                        "sim_time_s": float(getattr(base_env.data, "time", 0.0)),
+                        "camera": {
+                            "camera_id": "main",
+                            "body_name": cam_body,
+                            "camera_name": config.camera_name if cam_body is None else None,
+                            "pose_world0": {
+                                "pos": [float(x) for x in cam_pos_w0.tolist()],
+                                "mat3x3_rowmajor": [float(x) for x in cam_mat_w0.reshape(-1).tolist()],
+                            },
+                        },
+                        "annotations": annotations,
+                        "contacts": {"has_contact": bool(has_contact), "pairs": contact_pairs},
+                    }
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+                recorded += 1
+
+                if self.config.use_realtime_loop:
+                    elapsed = time.time() - loop_start
+                    if elapsed < realtime_step:
+                        time.sleep(realtime_step - elapsed)
+        finally:
+            # 关闭所有元数据文件
+            for _, f in meta_files:
+                f.close()
+            
+            # 停止视频录制（照搬 OrcaManipulation 的逻辑：只调用一次 stop_save_video）
+            if video_started:
+                try:
+                    env_adapter.stop_save_video()
+                    # 等待视频稳定
+                    first_runner._wait_for_video_stable(unified_video_dir, timeout_s=5.0)
+                    if len(group_setups) > 1:
+                        first_runner._distribute_videos_by_camera(unified_video_dir, group_setups)
+                except Exception as e:
+                    print(f"[OrcaGen] 警告：stop_save_video 失败（可能导致视频未 finalize）：{e}")
+
+        # 为每个组生成 index.json 和运动分析
+        for setup in group_setups:
+            config = setup["config"]
+            obj_ids = setup["obj_ids"]
+            obj_body_by_id = setup["obj_body_by_id"]
+            obj_site_by_id = setup["obj_site_by_id"]
+            cam_body = setup["cam_body"]
+            collision_times = setup["collision_times"]
+            obj_sizes = setup["obj_sizes"]
+            
+            motion_map = infer_motion_types(setup["meta_path"], obj_ids) if config.infer_motion else {oid: MotionType.UNKNOWN for oid in obj_ids}
+            index_path = os.path.join(setup["meta_dir"], "index.json")
+            size_source = "site_size" if config.object_source == "site" else "geom_size"
+            camera_name_filter = setup.get("camera_name_override", config.camera_name)
+            video_artifacts, camera_ids = first_runner._collect_video_artifacts(
+                video_save_dir=setup.get("target_video_dir", setup["video_save_dir"]),
+                seq_dir=setup["seq_dir"],
+                camera_name_filter=camera_name_filter,
+            ) if config.save_video else ([], [])
+            if not video_artifacts:
+                video_artifacts = [{"path": f"video/{config.video_subdir}.mp4", "camera_id": "main"}]
+            index = {
+                "version": "orcagen-metadata-0.1",
+                "sequence_id": setup["seq_id"],
+                "object": {"object_id": obj_ids[0], "name": obj_ids[0], "part": "main"},
+                "motion_mode": motion_map.get(obj_ids[0], MotionType.UNKNOWN).value,
+                "motion_modes": {oid: motion_map.get(oid, MotionType.UNKNOWN).value for oid in obj_ids},
+                "motion_start": 0,
+                "motion_end": total_frames - 1,
+                "collision_time": collision_times.get(obj_ids[0]),
+                "collision_times": collision_times,
+                "coordinate_system": {
+                    "world_definition": "world0 == camera(main) frame0",
+                    "axes": {"x": "right", "y": "down", "z": "forward"},
+                    "origin": "camera(main) position at frame0",
+                    "units": {"position": "meter", "angles": "deg", "angle_norm": "(-1,1)*180"},
+                },
+                "capture": {
+                    "fps": int(config.fps),
+                    "resolution": first_runner._parse_resolution(),
+                    "duration_s": float(config.duration_s),
+                    "render_style": config.render_style,
+                    "capture_mode": config.capture_mode,
+                    "time_step_s": float(config.time_step_s),
+                    "frame_skip": int(config.frame_skip),
+                },
+                "artifacts": {
+                    "video": video_artifacts,
+                    "project": {"path": "project/scene.usd", "format": "USD", "contains": "keyframes+dyn_cache"},
+                },
+                "objects": [
+                    {
+                        "object_id": oid,
+                        "body_name": obj_body_by_id.get(oid),
+                        "site_name": obj_site_by_id.get(oid),
+                        "semantic": {"class": "rigid", "category": "rigid"},
+                        "canonical_size_m": [float(obj_sizes[oid][0]), float(obj_sizes[oid][1]), float(obj_sizes[oid][2])],
+                        "motion_mode": motion_map.get(oid, MotionType.UNKNOWN).value,
+                        "size_source": size_source,
+                    }
+                    for oid in obj_ids
+                ],
+                "cameras": first_runner._build_camera_entries(
+                    cam_body=cam_body,
+                    camera_ids=camera_ids,
+                ),
+            }
+            with open(index_path, "w", encoding="utf-8") as f:
+                json.dump(index, f, ensure_ascii=False, indent=2)
+
+            if config.plot_motion:
+                first_runner._plot_motion(setup["meta_path"], setup["meta_dir"])
+
+            print("OK")
+            print("sequence_dir:", setup["seq_dir"])
+            print("index.json:", index_path)
+            print("metadata.jsonl:", setup["meta_path"])
+            if config.save_video:
+                print("video_dir:", setup.get("target_video_dir", setup["video_save_dir"]))
+
+        env_adapter.close()
+        print("[OrcaGen] 所有组录制完成")
+
 

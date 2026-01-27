@@ -22,6 +22,7 @@ class CaptureConfig:
     object_bodies: Optional[str] = None
     object_site: Optional[str] = None
     object_sites: Optional[str] = None
+    object_sites_groups: Optional[str] = None
     object_ids: Optional[str] = None
     camera_body: Optional[str] = None
     camera_name: str = "Camera"
@@ -40,7 +41,9 @@ class CaptureConfig:
     ws_video_wait_first_packet_s: float = 5.0
     ws_video_recv_timeout_s: float = 1.0
     ws_video_min_packets_to_mp4: int = 10
+    video_subdir: str = "rgb_main"
     sequence_id: Optional[str] = None
+    sequence_prefix: Optional[str] = None
     output_root: str = "/home/guojiatao/OrcaWorkStation/OrcaGen"
     infer_motion: bool = True
     plot_motion: bool = True
@@ -82,6 +85,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--object_source", choices=["site", "body"], default="site")
     ap.add_argument("--object_site", default=None)
     ap.add_argument("--object_sites", default=None)
+    ap.add_argument(
+        "--object_sites_groups",
+        default=None,
+        help='多子环境物体组，使用 "|" 分割，例如: "Bin1|Bin2"',
+    )
     ap.add_argument("--object_ids", default=None)
     ap.add_argument("--camera_body", default=None)
     ap.add_argument("--camera_name", default="Camera")
@@ -102,8 +110,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--ws_video_wait_first_packet_s", type=float, default=5.0)
     ap.add_argument("--ws_video_recv_timeout_s", type=float, default=1.0)
     ap.add_argument("--ws_video_min_packets_to_mp4", type=int, default=10)
+    ap.add_argument("--video_subdir", default="rgb_main")
 
     ap.add_argument("--sequence_id", default=None)
+    ap.add_argument("--sequence_prefix", default=None)
     ap.add_argument("--output_root", default="/home/guojiatao/OrcaWorkStation/OrcaGen")
     ap.add_argument("--infer_motion", action="store_true", default=True)
     ap.add_argument("--no_infer_motion", action="store_true")
