@@ -15,7 +15,7 @@ import numpy as np
 from orca_gym.core.orca_gym_local import CaptureMode
 from scripts.motion_analysis import infer_motion_types
 from orcagen.core.base import BaseRunner
-from orcagen.core.config import CaptureConfig
+from orcagen.core.config import CaptureConfig, resolve_output_root
 from orcagen.enums.motion import MotionType
 from envs.orcagym_env import OrcaGymEnvAdapter
 from orcagen.utils.fs import mkdirp
@@ -45,9 +45,7 @@ class CaptureRunner(BaseRunner):
         seq_dir, video_dir, project_dir, meta_dir = self._prepare_dirs(seq_id)
         ws_proc = None
 
-        if self.config.external_drive:
-            self.config.no_drive_sim = True
-            self.config.no_reset = True
+        # external_drive 模式已通过 config.apply_external_drive_mode() 规范化处理
 
         env_adapter = OrcaGymEnvAdapter(self.config)
         env_adapter.initialize()
@@ -81,12 +79,17 @@ class CaptureRunner(BaseRunner):
         if self.config.save_video:
             if self.config.capture_mode == "SYNC":
                 print("[OrcaGen] 提示：你当前使用 --capture_mode SYNC；若 Editor 端出现 CameraSyncManager WaitingLastFrame Timeout，建议改为 ASYNC。")
-            env_adapter.begin_save_video(video_save_dir, cap_mode)
+            env_adapter.begin_save_video(os.path.abspath(video_save_dir), cap_mode)
             video_started = True
 
         total_frames = int(round(self.config.duration_s * self.config.fps))
         meta_path = os.path.join(meta_dir, "metadata.jsonl")
         collision_times: Dict[str, Optional[int]] = {oid: None for oid in obj_ids}
+
+        # 用于友好打印：每隔3秒简述物体运动状态
+        last_status_print_time = time.time()
+        status_print_interval = 3.0
+        recent_positions: Dict[str, List[np.ndarray]] = {oid: [] for oid in obj_ids}
 
         def _start_ws_recorder() -> Optional[subprocess.Popen]:
             if not self.config.ws_video:
@@ -106,7 +109,7 @@ class CaptureRunner(BaseRunner):
                 "--name",
                 self.config.ws_video_name,
                 "--output_root",
-                self.config.output_root,
+                resolve_output_root(self.config.output_root),
                 "--sequence_id",
                 seq_id,
                 "--wait_first_packet_s",
@@ -137,6 +140,37 @@ class CaptureRunner(BaseRunner):
 
                     if not self.config.no_drive_sim:
                         _ = env.step(env.action_space.sample() if env.action_space.shape != (0,) else np.array([]))
+                    else:
+                        # external_drive 模式下，通过 gRPC 从服务器拉取最新状态
+                        # 然后更新本地 _mjData，这样 query_body_xpos_xmat_xquat 才能获取到最新坐标
+                        try:
+                            # 通过 gRPC 直接查询状态
+                            if hasattr(base_env, 'gym') and hasattr(base_env.gym, 'stub'):
+                                # 动态导入 mjc_message_pb2（OrcaGym 的 protos 路径）
+                                try:
+                                    import orca_gym.protos.mjc_message_pb2 as mjc_message_pb2
+                                    request = mjc_message_pb2.QueryAllQposQvelQaccRequest()
+                                except ImportError:
+                                    request = None
+                                
+                                if request is not None:
+                                    # 使用同步调用（因为我们在同步代码中）
+                                    response = base_env.loop.run_until_complete(
+                                        base_env.gym.stub.QueryAllQposQvelQacc(request)
+                                    )
+                                    # 更新本地 _mjData
+                                    if hasattr(base_env.gym, '_mjData') and base_env.gym._mjData is not None:
+                                        base_env.gym._mjData.qpos[:] = np.array(response.qpos)
+                                        base_env.gym._mjData.qvel[:] = np.array(response.qvel)
+                                        base_env.gym._mjData.qacc[:] = np.array(response.qacc)
+                                        base_env.gym._mjData.time = float(response.time) if hasattr(response, 'time') else base_env.gym._mjData.time
+                                        # 执行前向计算，更新 xpos, xmat, xquat 等
+                                        base_env.gym.mj_forward()
+                                        # 同步到封装的 data 对象
+                                        base_env.gym.update_data()
+                        except Exception:
+                            # 如果 gRPC 查询失败，静默处理（避免影响采集）
+                            pass
 
                     if do_render:
                         try:
@@ -144,13 +178,16 @@ class CaptureRunner(BaseRunner):
                             if self.config.ws_video and not ws_started:
                                 ws_proc = _start_ws_recorder()
                                 ws_started = True
+                            render_err_count = 0  # 成功时重置计数
                         except Exception:
                             render_err_count += 1
-                            if render_err_count <= 5 or (render_err_count % 60 == 0):
-                                print(f"[OrcaGen] 警告：env.render 失败（count={render_err_count}），将继续采集。")
-                            if self.config.external_drive and render_err_count == 5:
+                            # external_drive 模式下减少警告打印
+                            if not self.config.external_drive:
+                                if render_err_count <= 5 or (render_err_count % 60 == 0):
+                                    print(f"[OrcaGen] 警告：env.render 失败（count={render_err_count}），将继续采集。")
+                            elif render_err_count == 5:
                                 do_render = False
-                                print("[OrcaGen] external_drive 下连续 render 失败，后续将跳过 render，仅采集/录像。")
+                                print("[OrcaGen] external_drive 模式下连续 render 失败，后续将跳过 render，仅采集/录像。")
                     if (not do_render) and self.config.ws_video and (not ws_started):
                         try:
                             if base_env.get_current_frame() >= 0:
@@ -275,6 +312,33 @@ class CaptureRunner(BaseRunner):
                     }
                     f.write(json.dumps(rec, ensure_ascii=False) + "\n")
                     recorded += 1
+
+                    # 收集最近的位置用于状态打印
+                    for ann in annotations:
+                        oid = ann["object_id"]
+                        bbox = ann["bbox3d"]
+                        pos = np.array([bbox["x_center"], bbox["y_center"], bbox["z_center"]], dtype=np.float64)
+                        recent_positions[oid].append(pos)
+                        # 只保留最近30帧
+                        if len(recent_positions[oid]) > 30:
+                            recent_positions[oid].pop(0)
+
+                    # 每隔3秒打印一次物体运动状态
+                    current_time = time.time()
+                    if current_time - last_status_print_time >= status_print_interval:
+                        elapsed_s = recorded / float(self.config.fps)
+                        progress_pct = (recorded / max(total_frames, 1)) * 100.0
+                        status_lines = [f"[OrcaGen] 采集进度: {elapsed_s:.1f}s / {self.config.duration_s:.1f}s ({progress_pct:.1f}%)"]
+                        for oid in obj_ids:
+                            if len(recent_positions[oid]) >= 2:
+                                pos_list = recent_positions[oid]
+                                recent_dp = pos_list[-1] - pos_list[0]
+                                recent_speed = np.linalg.norm(recent_dp) / max((len(pos_list) - 1) / float(self.config.fps), 1e-6)
+                                status_lines.append(f"  {oid}: 位置=({pos_list[-1][0]:.3f}, {pos_list[-1][1]:.3f}, {pos_list[-1][2]:.3f})m, 速度≈{recent_speed:.3f}m/s")
+                            else:
+                                status_lines.append(f"  {oid}: 位置数据不足")
+                        print("\n".join(status_lines))
+                        last_status_print_time = current_time
 
                     if self.config.use_realtime_loop:
                         elapsed = time.time() - loop_start
@@ -429,7 +493,8 @@ class CaptureRunner(BaseRunner):
         return f"sequence_capture_{seq_label}_{now_id()}"
 
     def _prepare_dirs(self, seq_id: str):
-        seq_dir = os.path.join(self.config.output_root, seq_id)
+        output_root_abs = resolve_output_root(self.config.output_root)
+        seq_dir = os.path.join(output_root_abs, seq_id)
         video_dir = os.path.join(seq_dir, "video")
         project_dir = os.path.join(seq_dir, "project")
         meta_dir = os.path.join(seq_dir, "metadata")
@@ -513,7 +578,7 @@ class CaptureRunner(BaseRunner):
         if not self.config.camprobe:
             print("[OrcaGen] 警告：未找到相机 body，且未开启 --camprobe；将使用单位矩阵作为相机位姿。")
             return np.zeros(3, dtype=np.float64), np.eye(3, dtype=np.float64)
-        probe_dir = os.path.join(self.config.output_root, ".orcagen_camprobe", seq_id)
+        probe_dir = os.path.join(resolve_output_root(self.config.output_root), ".orcagen_camprobe", seq_id)
         mkdirp(probe_dir)
         cam0 = env_adapter.get_camera_pose(None, self.config.camera_name, probe_dir)
         return cam0.pos, cam0.mat
@@ -623,7 +688,7 @@ class CaptureRunner(BaseRunner):
                     fp = os.path.join(root, fn)
                     try:
                         s1 = os.path.getsize(fp)
-                        time.sleep(0.2)
+                        time.sleep(0.3)
                         s2 = os.path.getsize(fp)
                         if s2 != s1:
                             changed = True
@@ -705,12 +770,23 @@ class CaptureRunner(BaseRunner):
 
     def _distribute_videos_by_camera(self, unified_video_dir: str, group_setups: List[Dict]) -> None:
         video_files = []
-        for root, _, files in os.walk(unified_video_dir):
-            for fn in files:
-                if fn.lower().endswith((".mp4", ".h264", ".mov", ".avi")):
-                    video_files.append(os.path.join(root, fn))
+        max_retries = 3
+        for retry in range(max_retries):
+            video_files = []
+            if os.path.exists(unified_video_dir):
+                for root, _, files in os.walk(unified_video_dir):
+                    for fn in files:
+                        if fn.lower().endswith((".mp4", ".h264", ".mov", ".avi")):
+                            video_files.append(os.path.join(root, fn))
+            if video_files:
+                break
+            if retry < max_retries - 1:
+                print(f"[OrcaGen] 未找到视频文件，等待中... (重试 {retry + 1}/{max_retries})")
+                time.sleep(2.0)
+        
         if not video_files:
-            print("[OrcaGen] 警告：未找到视频文件，无法分发到各组目录")
+            print(f"[OrcaGen] 警告：在 {unified_video_dir} 中未找到视频文件，无法分发到各组目录")
+            print(f"[OrcaGen] 提示：请检查引擎日志，确认视频是否已成功保存")
             return
 
         camera_names = sorted({self._parse_camera_file(fp)[0] for fp in video_files})
@@ -846,9 +922,7 @@ class MultiGroupCaptureRunner(BaseRunner):
         # 多组共用一个录制目录（与 OrcaManipulation 一致：只录制一次，输出到一个目录）
         unified_video_dir = group_setups[0]["video_save_dir"]
 
-        if self.config.external_drive:
-            self.config.no_drive_sim = True
-            self.config.no_reset = True
+        # external_drive 模式已通过 config.apply_external_drive_mode() 规范化处理
 
         # 使用第一个组的配置初始化 env（所有组共享同一个 env）
         env_adapter = OrcaGymEnvAdapter(self.config)
@@ -901,15 +975,22 @@ class MultiGroupCaptureRunner(BaseRunner):
         if self.config.save_video:
             if self.config.capture_mode == "SYNC":
                 print("[OrcaGen] 提示：你当前使用 --capture_mode SYNC；若 Editor 端出现 CameraSyncManager WaitingLastFrame Timeout，建议改为 ASYNC。")
-            # 照搬 OrcaManipulation：只调用一次 begin_save_video
+            # 照搬 OrcaManipulation：只调用一次 begin_save_video（传递绝对路径）
             # 使用第一个组的目录作为统一录制目录（引擎不支持同时录制到多个目录）
             print(f"[OrcaGen] 多组录制：统一录制目录 = {unified_video_dir}")
-            env_adapter.begin_save_video(unified_video_dir, cap_mode)
+            env_adapter.begin_save_video(os.path.abspath(unified_video_dir), cap_mode)
             video_started = True
 
         total_frames = int(round(self.config.duration_s * self.config.fps))
         do_render = not self.config.no_render
         render_err_count = 0
+
+        # 用于友好打印：每隔3秒简述物体运动状态
+        last_status_print_time = time.time()
+        status_print_interval = 3.0
+        recent_positions: Dict[str, Dict[str, List[np.ndarray]]] = {}
+        for setup in group_setups:
+            recent_positions[setup["seq_id"]] = {oid: [] for oid in setup["obj_ids"]}
 
         # 打开所有组的元数据文件
         meta_files = []
@@ -925,17 +1006,52 @@ class MultiGroupCaptureRunner(BaseRunner):
 
                 if not self.config.no_drive_sim:
                     _ = env.step(env.action_space.sample() if env.action_space.shape != (0,) else np.array([]))
+                else:
+                    # external_drive 模式下，通过 gRPC 从服务器拉取最新状态
+                    # 然后更新本地 _mjData，这样 query_body_xpos_xmat_xquat 才能获取到最新坐标
+                    try:
+                        # 通过 gRPC 直接查询状态
+                        if hasattr(base_env, 'gym') and hasattr(base_env.gym, 'stub'):
+                            # 动态导入 mjc_message_pb2（OrcaGym 的 protos 路径）
+                            try:
+                                import orca_gym.protos.mjc_message_pb2 as mjc_message_pb2
+                                request = mjc_message_pb2.QueryAllQposQvelQaccRequest()
+                            except ImportError:
+                                request = None
+                            if request is not None:
+                                # 使用同步调用（因为我们在同步代码中）
+                                response = base_env.loop.run_until_complete(
+                                    base_env.gym.stub.QueryAllQposQvelQacc(request)
+                                )
+                            else:
+                                response = None
+                            # 更新本地 _mjData
+                            if response is not None and hasattr(base_env.gym, '_mjData') and base_env.gym._mjData is not None:
+                                base_env.gym._mjData.qpos[:] = np.array(response.qpos)
+                                base_env.gym._mjData.qvel[:] = np.array(response.qvel)
+                                base_env.gym._mjData.qacc[:] = np.array(response.qacc)
+                                base_env.gym._mjData.time = float(response.time) if hasattr(response, 'time') else base_env.gym._mjData.time
+                                # 执行前向计算，更新 xpos, xmat, xquat 等
+                                base_env.gym.mj_forward()
+                                # 同步到封装的 data 对象
+                                base_env.gym.update_data()
+                    except Exception as e:
+                        # 如果 gRPC 查询失败，静默处理（避免影响采集）
+                        pass
 
                 if do_render:
                     try:
                         env.render()
+                        render_err_count = 0  # 成功时重置计数
                     except Exception:
                         render_err_count += 1
-                        if render_err_count <= 5 or (render_err_count % 60 == 0):
-                            print(f"[OrcaGen] 警告：env.render 失败（count={render_err_count}），将继续采集。")
-                        if self.config.external_drive and render_err_count == 5:
+                        # external_drive 模式下减少警告打印
+                        if not self.config.external_drive:
+                            if render_err_count <= 5 or (render_err_count % 60 == 0):
+                                print(f"[OrcaGen] 警告：env.render 失败（count={render_err_count}），将继续采集。")
+                        elif render_err_count == 5:
                             do_render = False
-                            print("[OrcaGen] external_drive 下连续 render 失败，后续将跳过 render，仅采集/录像。")
+                            print("[OrcaGen] external_drive 模式下连续 render 失败，后续将跳过 render，仅采集/录像。")
 
                 try:
                     cur_frame = base_env.get_next_frame()
@@ -1049,8 +1165,40 @@ class MultiGroupCaptureRunner(BaseRunner):
                         "contacts": {"has_contact": bool(has_contact), "pairs": contact_pairs},
                     }
                     f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                    
+                    # 收集最近的位置用于状态打印
+                    for ann in annotations:
+                        oid = ann["object_id"]
+                        bbox = ann["bbox3d"]
+                        pos = np.array([bbox["x_center"], bbox["y_center"], bbox["z_center"]], dtype=np.float64)
+                        if oid in recent_positions[setup["seq_id"]]:
+                            recent_positions[setup["seq_id"]][oid].append(pos)
+                            # 只保留最近30帧
+                            if len(recent_positions[setup["seq_id"]][oid]) > 30:
+                                recent_positions[setup["seq_id"]][oid].pop(0)
 
                 recorded += 1
+
+                # 每隔3秒打印一次物体运动状态
+                current_time = time.time()
+                if current_time - last_status_print_time >= status_print_interval:
+                    elapsed_s = recorded / float(self.config.fps)
+                    progress_pct = (recorded / max(total_frames, 1)) * 100.0
+                    status_lines = [f"[OrcaGen] 多组采集进度: {elapsed_s:.1f}s / {self.config.duration_s:.1f}s ({progress_pct:.1f}%)"]
+                    for idx, (setup, _) in enumerate(meta_files):
+                        # 组索引从1开始显示（组 1, 组 2, 组 3, 组 4）
+                        group_display_idx = idx + 1
+                        status_lines.append(f"  组 {group_display_idx} ({setup['seq_id']}):")
+                        for oid in setup["obj_ids"]:
+                            pos_list = recent_positions.get(setup["seq_id"], {}).get(oid, [])
+                            if len(pos_list) >= 2:
+                                recent_dp = pos_list[-1] - pos_list[0]
+                                recent_speed = np.linalg.norm(recent_dp) / max((len(pos_list) - 1) / float(self.config.fps), 1e-6)
+                                status_lines.append(f"    {oid}: 位置=({pos_list[-1][0]:.3f}, {pos_list[-1][1]:.3f}, {pos_list[-1][2]:.3f})m, 速度≈{recent_speed:.3f}m/s")
+                            else:
+                                status_lines.append(f"    {oid}: 位置数据不足")
+                    print("\n".join(status_lines))
+                    last_status_print_time = current_time
 
                 if self.config.use_realtime_loop:
                     elapsed = time.time() - loop_start
@@ -1073,7 +1221,7 @@ class MultiGroupCaptureRunner(BaseRunner):
                     print(f"[OrcaGen] 警告：stop_save_video 失败（可能导致视频未 finalize）：{e}")
 
         # 为每个组生成 index.json 和运动分析
-        for setup in group_setups:
+        for idx, setup in enumerate(group_setups):
             config = setup["config"]
             obj_ids = setup["obj_ids"]
             obj_body_by_id = setup["obj_body_by_id"]
@@ -1081,6 +1229,8 @@ class MultiGroupCaptureRunner(BaseRunner):
             cam_body = setup["cam_body"]
             collision_times = setup["collision_times"]
             obj_sizes = setup["obj_sizes"]
+            # 组索引从1开始显示（组 1, 组 2, 组 3, 组 4）
+            group_display_idx = idx + 1
             
             motion_map = infer_motion_types(setup["meta_path"], obj_ids) if config.infer_motion else {oid: MotionType.UNKNOWN for oid in obj_ids}
             index_path = os.path.join(setup["meta_dir"], "index.json")
@@ -1144,6 +1294,15 @@ class MultiGroupCaptureRunner(BaseRunner):
 
             if config.plot_motion:
                 first_runner._plot_motion(setup["meta_path"], setup["meta_dir"])
+                # 打印运动判断结果和提示
+                if config.infer_motion:
+                    print(f"\n[OrcaGen] ========== 组 {group_display_idx} 运动模式判断结果 ==========")
+                    for oid in obj_ids:
+                        motion_type = motion_map.get(oid, MotionType.UNKNOWN)
+                        print(f"  物体 {oid}: {motion_type.value}")
+                    print("[OrcaGen] 提示：如果判断有误，请检查 scripts/motion_analysis.py 中的判断逻辑，")
+                    print("          或调整阈值参数（speed_small, speed_move, omega_small 等）。")
+                    print("=" * 50)
 
             print("OK")
             print("sequence_dir:", setup["seq_dir"])

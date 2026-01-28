@@ -18,6 +18,7 @@ from orcagen.enums.motion import MotionType
 class MotionStats:
     speed_med: float
     speed_p90: float
+    speed_std: float
     omega_med: float
     omega_p90: float
     contact_ratio: float
@@ -64,7 +65,7 @@ def _load_tracks(metadata_path: str, object_id: str) -> Tuple[List[float], List[
 
 def _compute_stats(ts: List[float], pos: List[np.ndarray], ang: List[np.ndarray], contact: List[bool]) -> MotionStats:
     if len(ts) < 3:
-        return MotionStats(0, 0, 0, 0, 0, 0, 0, 0, 0)
+        return MotionStats(0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
 
     speeds = []
     omegas = []
@@ -107,6 +108,7 @@ def _compute_stats(ts: List[float], pos: List[np.ndarray], ang: List[np.ndarray]
     return MotionStats(
         speed_med=float(np.median(speeds_np)),
         speed_p90=float(np.percentile(speeds_np, 90)),
+        speed_std=float(np.std(speeds_np)) if len(speeds_np) > 0 else 0.0,
         omega_med=float(np.median(omegas_np)),
         omega_p90=float(np.percentile(omegas_np, 90)),
         contact_ratio=contact_ratio,
@@ -129,6 +131,16 @@ def infer_motion_type(metadata_path: str, object_id: str) -> MotionType:
 
     if stats.speed_med < speed_small and stats.omega_med < omega_small:
         return MotionType.STATIC
+
+    # 匀速直线运动判断：速度较大且稳定，方向变化少，角速度小
+    # 速度一致性：速度标准差相对于中位数较小（变异系数 < 0.3）
+    speed_cv = stats.speed_std / max(stats.speed_med, 1e-6)  # 变异系数
+    is_uniform_speed = speed_cv < 0.3 and stats.speed_med > speed_move
+    is_linear_direction = stats.sign_changes_xy <= 2  # 方向变化很少
+    is_low_rotation = stats.omega_med < omega_small
+    
+    if is_uniform_speed and is_linear_direction and is_low_rotation:
+        return MotionType.UNIFORM_LINEAR
 
     if stats.sign_changes_xy >= 4 and stats.speed_med > speed_small:
         return MotionType.OSCILLATING

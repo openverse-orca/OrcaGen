@@ -9,5 +9,6 @@ class MotionType(str, Enum):
     ROTATING_IN_PLACE = "rotating_in_place"
     OSCILLATING = "oscillating"
     PENDULUM = "pendulum"
+    UNIFORM_LINEAR = "uniform_linear"
     UNKNOWN = "unknown"
 
