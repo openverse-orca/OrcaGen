@@ -35,6 +35,16 @@ python examples/run_capture.py \
 - `--save_video`：服务端录制视频（gRPC）
 - 默认 `no_render=True`，如需 render 可在配置里调整
 
+### 双进程采集（推荐：无外部仿真时）
+仿真与采集分两进程，避免单进程干扰导致运动顿挫。先启仿真（run_sim_loop），等 gRPC 就绪后再启采集。
+
+```bash
+python examples/run_capture_with_sim.py --object_sites_groups "Bin1|Bin2|Bin3|Bin4" --duration_s 20 --auto_frame_skip
+```
+
+- 仿真已由外部启动时加 `--external_sim`，不启 run_sim_loop，只跑采集。
+- 默认仿真命令：`python -m orca_gym.scripts.run_sim_loop`；可用 `--sim_loop_cmd`、`--sim_loop_wait_s`、`--no_kill_sim_on_exit`、`--orcagym_addr`。
+
 注意：
 - 为确保视频时长正确，需要在 OrcaStudio 中将 MuJoCoCamera 锁定为 30 帧：
   Home 键唤起菜单 → Video Options → 选择 30
