@@ -75,15 +75,13 @@ def _interactive_prompt(args: argparse.Namespace) -> argparse.Namespace:
         except KeyboardInterrupt:
             print("  使用默认值: external_drive=False")
     
-    # 3. 自动提取 sequence_prefix
+    # 3. 自动提取 sequence_prefix（将用作前缀，回车以继续）
     if args.object_sites_groups and not args.sequence_prefix:
         prefix = _extract_prefix_from_groups(args.object_sites_groups)
         if prefix:
+            args.sequence_prefix = prefix
             try:
-                user_input = input(f"检测到前缀 '{prefix}'，是否用作 sequence_prefix？(y/n，默认 y): ").strip().lower()
-                if user_input in ('', 'y', 'yes', '是'):
-                    args.sequence_prefix = prefix
-                    print(f"  ✓ 已设置 sequence_prefix = '{prefix}'")
+                input(f"检测到前缀 '{prefix}'，将用作 sequence_prefix(如果要手动修改 [OrcaGen] 请通过命令行手动指定：--sequence_prefix <前缀> 或 --sequence_id <序列名>)，回车以跳过: ")
             except KeyboardInterrupt:
                 pass
     

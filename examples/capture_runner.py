@@ -1294,14 +1294,12 @@ class MultiGroupCaptureRunner(BaseRunner):
 
             if config.plot_motion:
                 first_runner._plot_motion(setup["meta_path"], setup["meta_dir"])
-                # 打印运动判断结果和提示
+                # 打印运动判断结果（提示在所有组结束后统一打印）
                 if config.infer_motion:
                     print(f"\n[OrcaGen] ========== 组 {group_display_idx} 运动模式判断结果 ==========")
                     for oid in obj_ids:
                         motion_type = motion_map.get(oid, MotionType.UNKNOWN)
                         print(f"  物体 {oid}: {motion_type.value}")
-                    print("[OrcaGen] 提示：如果判断有误，请检查 scripts/motion_analysis.py 中的判断逻辑，")
-                    print("          或调整阈值参数（speed_small, speed_move, omega_small 等）。")
                     print("=" * 50)
 
             print("OK")
@@ -1312,6 +1310,9 @@ class MultiGroupCaptureRunner(BaseRunner):
                 print("video_dir:", setup.get("target_video_dir", setup["video_save_dir"]))
 
         env_adapter.close()
+        if self.group_configs and self.group_configs[0].infer_motion:
+            print("[OrcaGen] 提示：如果判断有误，请检查 scripts/motion_analysis.py 中的判断逻辑，")
+            print("          或调整阈值参数（speed_small, speed_move, omega_small 等）。")
         print("[OrcaGen] 所有组录制完成")
 
 
