@@ -79,8 +79,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--sim_loop_cmd",
-        default=os.getenv("ORCAGEN_SIM_LOOP_CMD", "python -m orca_gym.scripts.run_sim_loop"),
-        help="仿真循环命令（默认: python -m orca_gym.scripts.run_sim_loop）",
+        default=os.getenv("ORCAGEN_SIM_LOOP_CMD", f"{sys.executable} -m scripts.run_sim_loop_orcagen"),
+        help="仿真循环命令（默认: <当前python> -m scripts.run_sim_loop_orcagen；该定制版负责节拍，建议 OrcaStudio 解锁步进/视频帧）",
     )
     parser.add_argument(
         "--sim_loop_wait_s",
